@@ -1,5 +1,6 @@
 import sys
 import os
+import contextlib
 import distutils.errors
 import platform
 import time
@@ -12,6 +13,31 @@ import pytest
 
 import setuptools.package_index
 from .textwrap import DALS
+
+
+@contextlib.contextmanager
+def _no_shell():
+    """
+    Capture the VCS invocations made in the block, asserting that none of
+    them is handed to a shell (CVE-2024-6345).
+
+    Yields the list of argument vectors passed to ``subprocess.check_call``.
+    """
+    calls = []
+
+    def check_call(args, **kwargs):
+        assert not kwargs.get('shell'), "VCS command run through a shell"
+        calls.append(args)
+        return 0
+
+    def system(command):
+        raise AssertionError(
+            "os.system(%r): VCS commands must never reach a shell" % (command,)
+        )
+
+    with mock.patch("subprocess.check_call", check_call):
+        with mock.patch("os.system", system):
+            yield calls
 
 
 class TestPackageIndex:
@@ -198,56 +224,137 @@ class TestPackageIndex:
         url = 'git+https://github.example/group/project@master#egg=foo'
         index = setuptools.package_index.PackageIndex()
 
-        with mock.patch("os.system") as os_system_mock:
+        with _no_shell() as calls:
             result = index.download(url, str(tmpdir))
 
-        os_system_mock.assert_called()
-
         expected_dir = str(tmpdir / 'project@master')
-        expected = (
-            'git clone --quiet '
-            'https://github.example/group/project {expected_dir}'
-        ).format(**locals())
-        first_call_args = os_system_mock.call_args_list[0][0]
-        assert first_call_args == (expected,)
-
-        tmpl = 'git -C {expected_dir} checkout --quiet master'
-        expected = tmpl.format(**locals())
-        assert os_system_mock.call_args_list[1][0] == (expected,)
+        assert calls == [
+            [
+                'git', 'clone', '--quiet',
+                'https://github.example/group/project', expected_dir,
+            ],
+            ['git', '-C', expected_dir, 'checkout', '--quiet', 'master'],
+        ]
         assert result == expected_dir
 
     def test_download_git_no_rev(self, tmpdir):
         url = 'git+https://github.example/group/project#egg=foo'
         index = setuptools.package_index.PackageIndex()
 
-        with mock.patch("os.system") as os_system_mock:
+        with _no_shell() as calls:
             result = index.download(url, str(tmpdir))
 
-        os_system_mock.assert_called()
-
         expected_dir = str(tmpdir / 'project')
-        expected = (
-            'git clone --quiet '
-            'https://github.example/group/project {expected_dir}'
-        ).format(**locals())
-        os_system_mock.assert_called_once_with(expected)
+        assert calls == [
+            [
+                'git', 'clone', '--quiet',
+                'https://github.example/group/project', expected_dir,
+            ],
+        ]
+        assert result == expected_dir
+
+    def test_download_hg_with_rev(self, tmpdir):
+        url = 'hg+https://hg.example/project@default#egg=foo'
+        index = setuptools.package_index.PackageIndex()
+
+        with _no_shell() as calls:
+            result = index.download(url, str(tmpdir))
+
+        expected_dir = str(tmpdir / 'project@default')
+        assert calls == [
+            [
+                'hg', 'clone', '--quiet',
+                'https://hg.example/project', expected_dir,
+            ],
+            ['hg', '--cwd', expected_dir, 'up', '-C', '-r', 'default', '-q'],
+        ]
+        assert result == expected_dir
 
     def test_download_svn(self, tmpdir):
         url = 'svn+https://svn.example/project#egg=foo'
         index = setuptools.package_index.PackageIndex()
 
         with pytest.warns(UserWarning):
-            with mock.patch("os.system") as os_system_mock:
+            with _no_shell() as calls:
                 result = index.download(url, str(tmpdir))
 
-        os_system_mock.assert_called()
-
         expected_dir = str(tmpdir / 'project')
-        expected = (
-            'svn checkout -q '
-            'svn+https://svn.example/project {expected_dir}'
-        ).format(**locals())
-        os_system_mock.assert_called_once_with(expected)
+        assert calls == [
+            [
+                'svn', 'checkout', '-q',
+                'svn+https://svn.example/project', expected_dir,
+            ],
+        ]
+        assert result == expected_dir
+
+    # CVE-2024-6345: a VCS URL must never be interpolated into a shell
+    # command line.  Each case below is a URL whose path, revision or
+    # credentials carry shell metacharacters; the download must run the VCS
+    # tool through an argument vector, leaving the payload inert inside a
+    # single argv element.
+    @pytest.mark.filterwarnings('ignore::UserWarning')
+    @pytest.mark.parametrize(
+        'name,url,payload',
+        [
+            (
+                'project;$(touch pwned)',
+                'git+https://github.example/group/'
+                'project;$(touch pwned)#egg=foo',
+                'https://github.example/group/project;$(touch pwned)',
+            ),
+            (
+                'project@master;touch pwned',
+                'git+https://github.example/group/'
+                'project@master;touch pwned#egg=foo',
+                'master;touch pwned',
+            ),
+            (
+                'project;$(touch pwned)',
+                'hg+https://hg.example/project;$(touch pwned)#egg=foo',
+                'https://hg.example/project;$(touch pwned)',
+            ),
+            (
+                'project@default;touch pwned',
+                'hg+https://hg.example/project@default;touch pwned#egg=foo',
+                'default;touch pwned',
+            ),
+            (
+                'project;$(touch pwned)',
+                'svn+https://svn.example/project;$(touch pwned)#egg=foo',
+                'svn+https://svn.example/project;$(touch pwned)',
+            ),
+            (
+                'project;`touch pwned`',
+                'svn://user:pw@svn.example/project;`touch pwned`#egg=foo',
+                'svn://user:pw@svn.example/project;`touch pwned`',
+            ),
+            # the svn credentials are a separate interpolation site
+            (
+                'project',
+                'svn:////user:pw;touch pwned@svn.example/project#egg=foo',
+                '--password=pw;touch pwned',
+            ),
+        ],
+    )
+    def test_download_vcs_no_command_injection(
+            self, tmpdir, name, url, payload):
+        index = setuptools.package_index.PackageIndex()
+
+        with _no_shell() as calls:
+            result = index.download(url, str(tmpdir))
+
+        # the checkout lands where it was asked to, and nothing was run
+        # through a shell (``_no_shell`` fails the test on ``os.system`` /
+        # ``shell=True``)
+        assert result == os.path.join(str(tmpdir), name)
+        assert calls, "expected the VCS tool to be invoked"
+        for args in calls:
+            # an argument vector, so argv[0] is the program and every
+            # metacharacter in the remaining entries stays inert
+            assert isinstance(args, list)
+            assert args[0] in ('git', 'hg', 'svn')
+        # the payload does reach the command, as a single standalone argument
+        assert any(payload in args for args in calls)
 
 
 class TestContentCheckers:
