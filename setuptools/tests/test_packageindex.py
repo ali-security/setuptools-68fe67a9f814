@@ -2,6 +2,7 @@ import sys
 import os
 import distutils.errors
 import platform
+import time
 import urllib.request
 import urllib.error
 import http.client
@@ -308,3 +309,52 @@ class TestPyPIConfig:
         cred = cfg.creds_by_repository['https://pypi.org']
         assert cred.username == 'jaraco'
         assert cred.password == 'pity%'
+
+
+# Attack string for the REL regex: the unbounded whitespace repetitions used to
+# backtrack over the run of spaces for minutes before failing. The bounded
+# pattern rejects it after a few thousand steps, so any measurable delay here
+# means the vulnerable regex is back. The generous limit keeps the assertion
+# insensitive to load on a busy CI worker.
+REL_ATTACK = '< rel=' + ' ' * 2**12
+REL_TIME_LIMIT = 5
+
+
+def test_REL_DoS():
+    """
+    REL should not hang on a contrived attack string.
+    """
+    start = time.monotonic()
+    setuptools.package_index.REL.search(REL_ATTACK)
+    assert time.monotonic() - start < REL_TIME_LIMIT
+
+
+def test_find_external_links_DoS():
+    """
+    Scanning a page holding a contrived attack string should not hang.
+    """
+    page = '<a href="/pkg-1.0.tar.gz">pkg</a>' + REL_ATTACK
+    start = time.monotonic()
+    links = list(
+        setuptools.package_index.find_external_links('http://example.com', page)
+    )
+    assert time.monotonic() - start < REL_TIME_LIMIT
+    assert links == []
+
+
+def test_find_external_links_still_finds_links():
+    """
+    The bounded REL regex must still match the tags it always matched.
+    """
+    page = DALS("""
+        <a rel="homepage" href="http://example.com/home">home</a>
+        <a rel = 'download' href="/pkg-1.0.tar.gz">download</a>
+        <a rel="bookmark" href="http://example.com/nope">nope</a>
+        """)
+    links = list(
+        setuptools.package_index.find_external_links('http://example.com/', page)
+    )
+    assert links == [
+        'http://example.com/home',
+        'http://example.com/pkg-1.0.tar.gz',
+    ]
