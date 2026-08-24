@@ -5,6 +5,7 @@ import distutils.errors
 import platform
 import time
 import urllib.request
+import urllib.parse
 import urllib.error
 import http.client
 
@@ -355,6 +356,92 @@ class TestPackageIndex:
             assert args[0] in ('git', 'hg', 'svn')
         # the payload does reach the command, as a single standalone argument
         assert any(payload in args for args in calls)
+
+    # CVE-2025-47273: the download filename is derived from the URL, and
+    # ``os.path.join`` discards ``tmpdir`` outright whenever that name is
+    # absolute or carries a Windows drive letter.  Every path separator,
+    # drive letter and leading parent reference must therefore be sanitized
+    # away, confining the download to a single entry inside ``tmpdir``.
+    @pytest.mark.parametrize(
+        'name,expected',
+        [
+            # absolute POSIX path (the reported attack)
+            (
+                '/home/user/.ssh/authorized_keys',
+                '_home_user_.ssh_authorized_keys',
+            ),
+            # Windows drive letters, absolute and drive-relative
+            ('C:\\Windows\\Temp\\evil', 'C__Windows_Temp_evil'),
+            ('D:evil', 'D_evil'),
+            ('D:../evil', 'D___evil'),
+            # parent directory references
+            ('..', '_'),
+            ('../../etc/cron.d/evil', '____etc_cron.d_evil'),
+            ('..\\..\\evil', '____evil'),
+            # a relative subdirectory is not an escape, but is still not a
+            # location the caller asked to write to
+            ('subdir/evil', 'subdir_evil'),
+            # ordinary names are untouched
+            ('setuptools-52.0.0.tar.gz', 'setuptools-52.0.0.tar.gz'),
+            ('foo..bar', 'foo..bar'),
+        ],
+    )
+    def test_resolve_download_filename(self, tmpdir, name, expected):
+        url = 'https://anyhost/' + urllib.parse.quote(name, safe='')
+        index = setuptools.package_index.PackageIndex()
+
+        filename = index._resolve_download_filename(url, str(tmpdir))
+
+        assert filename == os.path.join(str(tmpdir), expected)
+        # the resolved name is a direct child of the download directory
+        assert os.path.dirname(filename) == str(tmpdir)
+
+    def test_resolve_download_filename_no_path(self, tmpdir):
+        index = setuptools.package_index.PackageIndex()
+
+        filename = index._resolve_download_filename(
+            'https://anyhost/', str(tmpdir))
+
+        assert filename == os.path.join(str(tmpdir), '__downloaded__')
+
+    def test_resolve_download_filename_egg_zip(self, tmpdir):
+        index = setuptools.package_index.PackageIndex()
+
+        filename = index._resolve_download_filename(
+            'https://anyhost/foo-1.0-py3.6.egg.zip', str(tmpdir))
+
+        assert filename == os.path.join(str(tmpdir), 'foo-1.0-py3.6.egg')
+
+    def test_download_bad_filename(self, tmpdir):
+        """
+        A URL naming an absolute path must be downloaded inside the
+        requested directory, never at the attacker-chosen location
+        (CVE-2025-47273).
+        """
+        outside = tmpdir / 'outside'
+        outside.mkdir()
+        # an absolute path on every platform, so the unpatched
+        # os.path.join(tmpdir, name) would discard tmpdir entirely
+        target = str(outside / 'pwned')
+        url = 'https://anyhost/' + urllib.parse.quote(target, safe='')
+
+        index = setuptools.package_index.PackageIndex()
+        written = []
+
+        def _download_to(self, url, filename):
+            written.append(filename)
+            with open(filename, 'wb') as fp:
+                fp.write(b'payload')
+            return {}
+
+        cls = setuptools.package_index.PackageIndex
+        with mock.patch.object(cls, '_download_to', _download_to):
+            result = index.download(url, str(tmpdir))
+
+        assert not os.path.exists(target), "wrote outside the download dir"
+        assert written == [result]
+        assert os.path.dirname(result) == str(tmpdir)
+        assert os.path.exists(result)
 
 
 class TestContentCheckers:
