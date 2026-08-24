@@ -8,6 +8,7 @@ import sys
 import tempfile
 import itertools
 import io
+import unicodedata
 from distutils import log
 from distutils.errors import DistutilsTemplateError
 
@@ -48,6 +49,25 @@ def quiet():
 
 def touch(filename):
     open(filename, 'w').close()
+
+
+def both_forms(name):
+    """Return *name* composed (NFC) and decomposed (NFD), asserting they differ."""
+    nfc = unicodedata.normalize('NFC', name)
+    nfd = unicodedata.normalize('NFD', name)
+    assert nfc != nfd  # the two byte forms genuinely differ
+    return nfc, nfd
+
+
+# Every ``MANIFEST.in`` exclusion directive is routed through
+# ``translate_pattern``, so each one must be insensitive to the Unicode
+# normalization form of the name it is handed (GHSA-h35f-9h28-mq5c).
+# ``prune`` names a directory instead of a file and is covered separately.
+unicode_exclusion_directives = [
+    'exclude app/{name}',
+    'global-exclude {name}',
+    'recursive-exclude app {name}',
+]
 
 
 # The set of files always in the manifest, including all files in the
@@ -154,6 +174,21 @@ def test_translated_pattern_match(pattern_match):
 def test_translated_pattern_mismatch(pattern_mismatch):
     pattern, target = pattern_mismatch
     assert not translate_pattern(pattern).match(target)
+
+
+def test_translate_pattern_unicode_normalization():
+    """
+    Matching is insensitive to Unicode normalization form: a pattern authored
+    in one form matches a path stored on disk in another (and vice versa), so
+    that an exclusion cannot be bypassed by an NFC/NFD mismatch.
+
+    Regression test for GHSA-h35f-9h28-mq5c.
+    """
+    nfc = unicodedata.normalize('NFC', 'café.txt')  # 'café.txt' composed
+    nfd = unicodedata.normalize('NFD', 'café.txt')  # 'café.txt' decomposed
+    assert nfc != nfd  # the two byte forms genuinely differ
+    assert translate_pattern(nfc).match(nfd)
+    assert translate_pattern(nfd).match(nfc)
 
 
 class TempDirTestCase:
@@ -313,6 +348,88 @@ class TestManifestTest(TempDirTestCase):
         files = default_files | set([
             ml('app/a.txt'), ml('app/b.txt'), ml('app/c.rst')])
         assert files == self.get_files()
+
+    def test_global_exclude_unicode_normalization(self):
+        """
+        A ``global-exclude`` authored NFC must drop a file whose on-disk name
+        is NFD: on macOS APFS/HFS+ the two are the same file, and even on
+        case/normalization-exact filesystems the decomposed name can be
+        committed and reach the build. Otherwise the file is published in the
+        sdist despite the exclusion.
+
+        Regression test for GHSA-h35f-9h28-mq5c.
+        """
+        nfc_name = unicodedata.normalize('NFC', 'café.txt')
+        nfd_name = unicodedata.normalize('NFD', 'café.txt')
+        assert nfc_name != nfd_name
+        # write the file under its decomposed (NFD) name ...
+        touch(os.path.join(self.temp_dir, 'app', nfd_name))
+        # ... and exclude it with the composed (NFC) form.
+        self.make_manifest(
+            """
+            global-include *.txt
+            global-exclude {name}
+            """.format(name=nfc_name))
+        leaked = {
+            f
+            for f in self.get_files()
+            if unicodedata.normalize('NFC', os.path.basename(f)) == nfc_name
+        }
+        assert not leaked, "excluded file leaked into manifest: %s" % (leaked,)
+
+    def _normalized_files(self):
+        """``get_files()`` with every entry NFC-normalized for comparison."""
+        return {unicodedata.normalize('NFC', f) for f in self.get_files()}
+
+    @pytest.mark.parametrize('directive', unicode_exclusion_directives)
+    def test_unicode_normalized_exclusion(self, directive):
+        """
+        Every exclusion directive must drop a file whose on-disk name is NFD
+        when the directive names it NFC. A second NFD-named file that nothing
+        excludes is asserted to remain, so the first one's absence really is
+        the exclusion working and not a failure to walk decomposed names.
+
+        Regression test for GHSA-h35f-9h28-mq5c.
+        """
+        ml = make_local_path
+        nfc, nfd = both_forms('café.txt')
+        kept_nfc, kept_nfd = both_forms('naïve.txt')
+        touch(os.path.join(self.temp_dir, 'app', nfd))
+        touch(os.path.join(self.temp_dir, 'app', kept_nfd))
+        self.make_manifest(
+            """
+            global-include *.txt
+            {line}
+            """.format(line=directive.format(name=nfc)))
+        files = self._normalized_files()
+        # the control file proves decomposed names do reach the manifest
+        assert ml('app/' + kept_nfc) in files
+        assert ml('app/' + nfc) not in files
+
+    def test_prune_unicode_normalization(self):
+        """
+        ``prune`` names a directory, so it must drop the files under a
+        directory whose on-disk name is NFD when the directive names it NFC.
+        A sibling NFD-named directory that is not pruned stays, proving the
+        walk reaches decomposed directory names in the first place.
+
+        Regression test for GHSA-h35f-9h28-mq5c.
+        """
+        ml = make_local_path
+        nfc, nfd = both_forms('café')
+        kept_nfc, kept_nfd = both_forms('naïve')
+        for name in (nfd, kept_nfd):
+            os.mkdir(os.path.join(self.temp_dir, 'app', name))
+            touch(os.path.join(self.temp_dir, 'app', name, 'secret.txt'))
+        self.make_manifest(
+            """
+            global-include *.txt
+            prune app/{name}
+            """.format(name=nfc))
+        files = self._normalized_files()
+        # the un-pruned sibling proves decomposed dir names do reach the walk
+        assert ml('app/' + kept_nfc + '/secret.txt') in files
+        assert ml('app/' + nfc + '/secret.txt') not in files
 
 
 class TestFileListTest(TempDirTestCase):
