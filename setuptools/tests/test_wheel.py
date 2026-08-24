@@ -519,7 +519,16 @@ WHEEL_INSTALL_TESTS = (
 
 
 @pytest.mark.parametrize(
-    'params', WHEEL_INSTALL_TESTS,
+    'params', [
+        # The 'extension' case compiles a C extension. This release's
+        # setuptools/msvc.py only knows Visual Studio up to VS2019, so the
+        # vcvarsall path it needs is absent on the VS2022 Windows runners.
+        pytest.param(params, marks=pytest.mark.skipif(
+            sys.platform == 'win32',
+            reason="setuptools 52's MSVC discovery predates VS2022",
+        )) if params['id'] == 'extension' else params
+        for params in WHEEL_INSTALL_TESTS
+    ],
     ids=list(params['id'] for params in WHEEL_INSTALL_TESTS),
 )
 def test_wheel_install(params):

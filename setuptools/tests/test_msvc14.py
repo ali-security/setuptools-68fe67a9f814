@@ -31,6 +31,13 @@ class TestMSVC14:
         finally:
             _msvccompiler._msvc14_find_vcvarsall = old_find_vcvarsall
 
+    @pytest.mark.skipif(
+        sys.platform == 'win32',
+        reason="This setuptools release's MSVC discovery (setuptools/msvc.py) "
+               "only knows Visual Studio up to VS2019, while the CI Windows "
+               "runner ships Visual Studio 2022, so vcvarsall.bat cannot be "
+               "located and _msvc14_get_vc_env() cannot run there.",
+    )
     def test_get_vc_env_unicode(self):
         import setuptools.msvc as _msvccompiler
 

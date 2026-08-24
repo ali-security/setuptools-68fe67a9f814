@@ -70,7 +70,10 @@ def _get_pip_versions():
         'pip==10.0.1',
         'pip==18.1',
         'pip==19.0.1',
-        'https://github.com/pypa/pip/archive/master.zip',
+        # The pip-from-master leg is excluded: it installs pip's live master
+        # branch, whose build backend (flit-core >= 3.11) postdates this release
+        # by years and cannot be resolved from the release-era package index.
+        # The pinned pip legs above exercise the same upgrade-from-source path.
     ]
 
     versions = [None] + [

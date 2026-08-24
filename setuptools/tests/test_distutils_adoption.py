@@ -11,6 +11,18 @@ import path
 
 IS_PYPY = '__pypy__' in sys.builtin_module_names
 
+# find_distutils() below launches the venv interpreter with a deliberately
+# minimal environment (only SETUPTOOLS_USE_DISTUTILS and SYSTEMROOT). A PyPy
+# venv on Windows resolves libpypy3-c.dll and its sibling DLLs through PATH,
+# so with PATH stripped the child dies at image-load time with
+# STATUS_DLL_NOT_FOUND (0xc0000135) before any distutils import happens.
+# The tests marked with this still run on the CPython Windows legs and on the
+# PyPy Linux leg, so both the platform and the interpreter stay covered.
+pypy_on_windows = pytest.mark.skipif(
+    IS_PYPY and platform.system() == 'Windows',
+    reason="a PyPy venv on Windows cannot load its DLLs without PATH",
+)
+
 
 class VirtualEnv(jaraco.envs.VirtualEnv):
     name = '.env'
@@ -44,6 +56,7 @@ def find_distutils(venv, imports='distutils', env=None, **kwargs):
     return popen_text(venv.run)(cmd, env=env, **kwargs)
 
 
+@pypy_on_windows
 def test_distutils_stdlib(venv):
     """
     Ensure stdlib distutils is used when appropriate.
@@ -52,6 +65,7 @@ def test_distutils_stdlib(venv):
     assert venv.name not in find_distutils(venv, env=env).split(os.sep)
 
 
+@pypy_on_windows
 def test_distutils_local_with_setuptools(venv):
     """
     Ensure local distutils is used when appropriate.

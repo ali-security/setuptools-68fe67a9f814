@@ -2,6 +2,8 @@ import sys
 import distutils.command.build_ext as orig
 from distutils.sysconfig import get_config_var
 
+import pytest
+
 from setuptools.command.build_ext import build_ext, get_abi3_suffix
 from setuptools.dist import Distribution
 from setuptools.extension import Extension
@@ -47,6 +49,12 @@ class TestBuildExt:
             assert 'abi3' in res
 
 
+@pytest.mark.skipif(
+    sys.platform == 'win32',
+    reason="this release's setuptools/msvc.py only knows Visual Studio up to "
+           "VS2019, so the vcvarsall/C-extension build path cannot run on the "
+           "VS2022 Windows runners",
+)
 def test_build_ext_config_handling(tmpdir_cwd):
     files = {
         'setup.py': DALS(

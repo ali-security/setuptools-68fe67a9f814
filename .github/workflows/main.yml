@@ -1,35 +1,131 @@
 name: tests
 
-on: [push, pull_request]
+on:
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: "Optional pytest selector; empty runs the full suite"
+        required: false
+        default: ""
 
 jobs:
   test:
     strategy:
+      fail-fast: false
       matrix:
-        python: [3.6, 3.8, 3.9, pypy3]
-        platform: [ubuntu-latest, macos-latest, windows-latest]
+        # upstream's floating `pypy3` resolves to PyPy 3.11 today, which none of
+        # this era's pinned test dependencies support; PyPy3 in Jan 2021 was 3.7.
+        python: ["3.6", "3.8", "3.9", "pypy-3.7"]
+        platform: [ubuntu-22.04, macos-latest, windows-latest]
+        exclude:
+          # macos-latest is arm64: CPython 3.6 predates macOS arm64 support
+          # (added in 3.9.1) and PyPy 3.7 ships no darwin-arm64 build, so
+          # neither interpreter can be provisioned or built there.
+          - python: "3.6"
+            platform: macos-latest
+          - python: "pypy-3.7"
+            platform: macos-latest
     runs-on: ${{ matrix.platform }}
+    timeout-minutes: 40
+    env:
+      # `-n auto` (pyproject's pytest-enabler xdist setting) fans out to every
+      # core; on the Windows runners that exhausts the paging file while the
+      # compiled mypy extension loads ("DLL load failed ... paging file is too
+      # small", then MemoryError). Cap the worker count instead of dropping
+      # xdist, so the same tests still run in parallel.
+      PYTEST_XDIST_AUTO_NUM_WORKERS: 2
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v4
       - name: Setup Python
-        uses: actions/setup-python@v2
+        if: ${{ !startsWith(matrix.python, 'pypy') }}
+        uses: MatteoH2O1999/setup-python@v4
+        with:
+          python-version: ${{ matrix.python }}
+          cache-build: true
+          allow-build: allow
+      - name: Setup PyPy
+        if: ${{ startsWith(matrix.python, 'pypy') }}
+        uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python }}
       - name: Install tox
+        env:
+          # Resolve the versions that existed when 52.0.0 was released
+          # (2021-01-24); the modern index breaks this era's tox/pytest plugins.
+          # Scoped to this step and the dependency install below, NEVER to the
+          # test run: setuptools' own fetch_build_egg defers to a PIP_INDEX_URL
+          # in the environment, which silently breaks
+          # test_setup_requires_honors_fetch_params and test_dist_fetch_build_egg,
+          # and a job-wide value also makes setup-python's post-install step
+          # downgrade its own pip mid-flight and abort the macOS legs.
+          PIP_INDEX_URL: https://:2021-02-01@time-machines-pypi.sealsecurity.io/
         run: |
-          python -m pip install tox
+          # The era-pinned virtualenv 20.4.0 that tox 3 pulls in probes the
+          # ambient interpreter's distutils; against the runner's preinstalled
+          # modern setuptools that dies with
+          # "canonicalize_version() got an unexpected keyword argument
+          # 'strip_trailing_zero'". Roll the ambient pip/setuptools/wheel back to
+          # the release era too so the whole harness is self-consistent, and so
+          # the venv virtualenv seeds carries the pip that still does legacy
+          # editable installs (tox.ini sets usedevelop and PIP_USE_PEP517, which
+          # modern pip refuses without setuptools' build_editable hook).
+          python -m pip install "pip==20.3.3" "setuptools==51.3.3" "wheel==0.36.2"
+          python -m pip install "virtualenv==20.4.0" tox
+      - name: Install test dependencies
+        env:
+          PIP_INDEX_URL: https://:2021-02-01@time-machines-pypi.sealsecurity.io/
+          # atomicwrites is pytest's win32-only dependency and the time-machine
+          # mirror carries no files for it at any date, so pip backtracked the
+          # whole Windows stack down to pytest 3.5.1. A find-links pointing at
+          # that one project's simple page supplies it without letting anything
+          # else resolve off the release-era index.
+          PIP_FIND_LINKS: https://pypi.org/simple/atomicwrites/
+          # typed-ast 1.4.x is a hard dependency of this era's black; it predates
+          # arm64 macOS wheels, so it is compiled from source there and its C
+          # source trips warnings that current clang treats as errors.
+          CFLAGS: -Wno-error=implicit-function-declaration -Wno-error=int-conversion -Wno-error=incompatible-pointer-types -Wno-error=incompatible-function-pointer-types
+        run: tox --notest
       - name: Run tests
-        run: tox
+        run: tox -- ${{ inputs.test-filter }}
+
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      PIP_INDEX_URL: https://:2021-01-24@time-machines-pypi.sealsecurity.io/
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: 3.9
+      - name: Install build tooling
+        run: |
+          python -m pip install build path
+      - name: Build sdist and wheel
+        run: |
+          python -m bootstrap
+          python -c "import path; path.Path('dist').rmtree_p()"
+          # unset tag_build and tag_date pypa/setuptools#2500
+          python setup.py egg_info -Db "" saveopts
+          python -m build
+      - name: Upload distributions
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/*
+          if-no-files-found: error
 
   release:
     needs: test
-    if: github.event_name == 'push' && contains(github.ref, 'refs/tags/')
+    if: false
     runs-on: ubuntu-latest
+    timeout-minutes: 30
 
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v4
       - name: Setup Python
-        uses: actions/setup-python@v2
+        uses: actions/setup-python@v5
         with:
           python-version: 3.9
       - name: Install tox

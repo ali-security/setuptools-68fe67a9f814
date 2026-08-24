@@ -96,6 +96,13 @@ def test_virtualenvwrapper(install_context):
                  'virtualenvwrapper', 'hook_loader.py')
 
 
+@pytest.mark.skip(
+    reason="easy_install resolves pbr against live PyPI, so this asserts a "
+           "module path inside whatever pbr release is current; pbr dropped "
+           "pbr/core.py after this setuptools release, and the fetch cannot be "
+           "pinned to the release-era index because easy_install does not read "
+           "PIP_INDEX_URL.",
+)
 def test_pbr(install_context):
     _install_one('pbr', install_context,
                  'pbr', 'core.py')
